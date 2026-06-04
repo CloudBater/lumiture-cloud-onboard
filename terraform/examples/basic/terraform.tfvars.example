@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars (gitignored by the module's .gitignore) and fill in.
+#
+# Then: terraform init && terraform plan && terraform apply
+
+terraform_runner_project = "your-tf-runner-project"
+
+billing_account_id     = "NNNNNN-NNNNNN-NNNNNN"
+export_project_id      = "my-billing-export-project"
+detailed_usage_dataset = "billing_detailed_export"
+pricing_dataset        = "billing_pricing_export"

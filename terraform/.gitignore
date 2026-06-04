@@ -1,0 +1,25 @@
+# Terraform working directory + state
+.terraform/
+.terraform.tfstate.lock.info
+
+# State files — never commit
+*.tfstate
+*.tfstate.*
+
+# Backup files
+*.tfstate.backup
+
+# Sensitive inputs — committers should never check these in
+*.tfvars
+!*.tfvars.example
+*.auto.tfvars
+
+# Plan files
+*.tfplan
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Keep lock files — they pin provider versions for reproducibility
+!.terraform.lock.hcl
