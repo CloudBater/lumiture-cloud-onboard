@@ -24,10 +24,16 @@
 #
 # Optional:
 #   --grant-scope            project|dataset             default: dataset (tighter)
+#   --with-usage             also grant roles/monitoring.viewer on the scoping project
+#                            (usage/rightsizing metrics) + optional usage submit
+#   --scoping-project        <project-id>                scoping project for usage metrics
+#                                                        (default: --export-project)
+#   --skip-billing           usage-only: skip all billing discovery/grants and do JUST
+#                            the usage grant. Implies --with-usage; requires
+#                            --scoping-project. For orgs already billing-onboarded.
 #   --lumiture-sa            <email>                     default: prod SA (lumiture-client@tw-rd-app-finops-prod...)
 #   --lumiture-api           <https://api.lumiture.ai>   for auto-submit; omit to skip submit
 #   --lumiture-jwt           <token>                     provide to auto-submit; omit to finish in the wizard
-#   --env                    prod|dev|staging|sandbox    default: prod (selects SA + API base)
 #   --discover-only          run discovery + report only; no grants, no submit
 #   --dry-run                print commands without executing
 #   --verbose                set -x
@@ -41,14 +47,11 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 
 readonly LUMITURE_SA_PROD="lumiture-client@tw-rd-app-finops-prod.iam.gserviceaccount.com"
-readonly LUMITURE_SA_DEV="lumiture-client@tw-rd-app-finops-dev.iam.gserviceaccount.com"
-# Sandbox shares the dev environment's service account, different API URL.
-readonly LUMITURE_SA_SANDBOX="lumiture-client@tw-rd-app-finops-dev.iam.gserviceaccount.com"
 readonly LUMITURE_API_PROD="https://api.lumiture.ai"
-readonly LUMITURE_API_DEV="https://dev-api.lumiture.ai"
-readonly LUMITURE_API_STAGING="https://stg-api.lumiture.ai"
-readonly LUMITURE_API_SANDBOX="https://sandbox-api.lumiture.ai"
 readonly REQUIRED_ROLE="roles/bigquery.dataViewer"
+# Usage/rightsizing: LumiTure reads Cloud Monitoring metrics (CPU utilization etc.)
+# from a scoping project — needs roles/monitoring.viewer there.
+readonly USAGE_ROLE="roles/monitoring.viewer"
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -70,10 +73,12 @@ EXPORT_PROJECT_ID=""
 DETAILED_USAGE_DATASET=""
 PRICING_DATASET=""
 GRANT_SCOPE="dataset"
+WITH_USAGE=0
+SKIP_BILLING=0
+SCOPING_PROJECT_ID=""
 LUMITURE_SA=""
 LUMITURE_API=""
 LUMITURE_JWT=""
-ENV="prod"
 DISCOVER_ONLY=0
 DRY_RUN=0
 
@@ -84,10 +89,12 @@ while [[ $# -gt 0 ]]; do
     --detailed-usage-dataset) DETAILED_USAGE_DATASET="$2"; shift 2 ;;
     --pricing-dataset) PRICING_DATASET="$2"; shift 2 ;;
     --grant-scope) GRANT_SCOPE="$2"; shift 2 ;;
+    --with-usage) WITH_USAGE=1; shift ;;
+    --skip-billing) SKIP_BILLING=1; shift ;;
+    --scoping-project) SCOPING_PROJECT_ID="$2"; shift 2 ;;
     --lumiture-sa) LUMITURE_SA="$2"; shift 2 ;;
     --lumiture-api) LUMITURE_API="$2"; shift 2 ;;
     --lumiture-jwt) LUMITURE_JWT="$2"; shift 2 ;;
-    --env) ENV="$2"; shift 2 ;;
     --discover-only) DISCOVER_ONLY=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --verbose) set -x; shift ;;
@@ -96,23 +103,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Resolve env-dependent defaults
-if [[ -z "${LUMITURE_SA}" ]]; then
-  case "${ENV}" in
-    prod) LUMITURE_SA="${LUMITURE_SA_PROD}" ;;
-    dev|staging) LUMITURE_SA="${LUMITURE_SA_DEV}" ;;
-    sandbox) LUMITURE_SA="${LUMITURE_SA_SANDBOX}" ;;
-    *) die "Unknown --env: ${ENV} (prod|dev|staging|sandbox)" ;;
-  esac
-fi
-if [[ -z "${LUMITURE_API}" ]]; then
-  case "${ENV}" in
-    prod) LUMITURE_API="${LUMITURE_API_PROD}" ;;
-    dev) LUMITURE_API="${LUMITURE_API_DEV}" ;;
-    staging) LUMITURE_API="${LUMITURE_API_STAGING}" ;;
-    sandbox) LUMITURE_API="${LUMITURE_API_SANDBOX}" ;;
-  esac
-fi
+# Defaults target LumiTure production; override with --lumiture-sa / --lumiture-api if needed.
+[[ -n "${LUMITURE_SA}" ]] || LUMITURE_SA="${LUMITURE_SA_PROD}"
+[[ -n "${LUMITURE_API}" ]] || LUMITURE_API="${LUMITURE_API_PROD}"
 
 # -----------------------------------------------------------------------------
 # Run helper — respects --dry-run
@@ -139,18 +132,25 @@ preflight() {
   log "Pre-flight checks…"
 
   command -v gcloud >/dev/null || die "gcloud CLI not found"
-  command -v bq >/dev/null || die "bq CLI not found"
   command -v jq >/dev/null || die "jq not found — install via 'brew install jq' / 'apt install jq'"
-  ok "Required tools installed (gcloud, bq, jq)"
+  # bq + ADC are only needed for the billing reads; usage-only mode skips them.
+  if [[ "${SKIP_BILLING}" -eq 0 ]]; then
+    command -v bq >/dev/null || die "bq CLI not found"
+    ok "Required tools installed (gcloud, bq, jq)"
+  else
+    ok "Required tools installed (gcloud, jq) — usage-only, bq not needed"
+  fi
 
   local active_acct
   active_acct=$(gcloud config get-value account 2>/dev/null || true)
   [[ -n "${active_acct}" ]] || die "No active gcloud account — run 'gcloud auth login' first"
   ok "Active gcloud account: ${active_acct}"
 
-  gcloud auth application-default print-access-token >/dev/null 2>&1 \
-    || die "Application Default Credentials not set — run 'gcloud auth application-default login'"
-  ok "ADC configured"
+  if [[ "${SKIP_BILLING}" -eq 0 ]]; then
+    gcloud auth application-default print-access-token >/dev/null 2>&1 \
+      || die "Application Default Credentials not set — run 'gcloud auth application-default login'"
+    ok "ADC configured"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -396,11 +396,64 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
+# Phase 4 — Usage / rightsizing (opt-in: --with-usage)
+# Usage data is Cloud Monitoring metrics (CPU utilization etc.), NOT the
+# "Detailed Usage Cost" billing export. LumiTure reads them from a scoping
+# project, so the SA needs roles/monitoring.viewer there. Then the in-product
+# usage step (POST /platforms/gcp/usage/integration) registers the scoping project.
+# -----------------------------------------------------------------------------
+
+grant_usage_monitoring() {
+  local scoping="${SCOPING_PROJECT_ID:-${EXPORT_PROJECT_ID}}"
+  [[ -n "${scoping}" ]] || die "--with-usage needs a scoping project (--scoping-project or --export-project)"
+
+  log "Phase 4 — Granting ${USAGE_ROLE} on SCOPING PROJECT ${scoping} to ${LUMITURE_SA} (usage metrics)…"
+  run gcloud projects add-iam-policy-binding "${scoping}" \
+    --member="serviceAccount:${LUMITURE_SA}" \
+    --role="${USAGE_ROLE}" \
+    --condition=None \
+    --quiet
+  ok "Monitoring-viewer grant applied on scoping project ${scoping}"
+
+  log "Phase 4 — Usage form value: scoping_project_id = ${scoping}"
+
+  # Optional auto-submit of the usage integration (parallels billing submit).
+  [[ -n "${LUMITURE_API}" && -n "${LUMITURE_JWT}" ]] || { ok "Grant done. Enter scoping_project_id='${scoping}' in the LumiTure usage step to finish."; return 0; }
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "DRY-RUN: would POST ${LUMITURE_API}/platforms/gcp/usage/integration"
+    return 0
+  fi
+  local http_status
+  http_status=$(curl -s -o /tmp/lumiture-usage-submit.out -w '%{http_code}' \
+    -X POST "${LUMITURE_API}/platforms/gcp/usage/integration" \
+    -H "Authorization: Bearer ${LUMITURE_JWT}" \
+    -H "Content-Type: application/json" \
+    -d "{\"scoping_project_id\": \"${scoping}\"}")
+  if [[ "${http_status}" -ge 200 && "${http_status}" -lt 300 ]]; then
+    ok "LumiTure usage integration created (HTTP ${http_status})"
+  else
+    warn "Usage submit returned HTTP ${http_status} — finish in the wizard with scoping_project_id='${scoping}'"
+    cat /tmp/lumiture-usage-submit.out >&2
+  fi
+}
+
+# -----------------------------------------------------------------------------
 # Main flow
 # -----------------------------------------------------------------------------
 
 main() {
   preflight
+
+  # Usage-only mode: skip all billing work, do just the monitoring grant + submit.
+  if [[ "${SKIP_BILLING}" -eq 1 ]]; then
+    [[ -n "${SCOPING_PROJECT_ID}" ]] || die "--skip-billing requires --scoping-project (no --export-project to default from in usage-only mode)"
+    WITH_USAGE=1
+    log "--skip-billing — usage-only run (no billing discovery/grants)"
+    grant_usage_monitoring
+    ok "GCP usage-only onboarding complete"
+    return 0
+  fi
+
   discover_billing_account
   discover_export_project
   validate_freshness
@@ -428,6 +481,7 @@ main() {
 
   emit_form_values
   submit_to_lumiture
+  [[ "${WITH_USAGE}" -eq 1 ]] && grant_usage_monitoring
   ok "GCP onboarding complete"
 }
 
