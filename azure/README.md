@@ -9,8 +9,8 @@
 | Customer grant | IAM on existing BQ export | **Admin-consent** to LumiTure SP **+** RBAC roles |
 | One un-scriptable step | Enable billing export (Console-only) | **Admin consent** (Microsoft browser flow) |
 | Native shell | Google Cloud Shell (auto-clones repo via badge) | **Azure Cloud Shell** (no auto-clone — `git clone` in Step 0) |
-| Data path | BQ dataset read directly | Cost Mgmt **export → Blob → GCS → BigQuery** |
-| IaC vehicle | Terraform (`../terraform/`) | **Bicep** (`bicep/`) |
+| Data path | BQ dataset read directly | Cost Mgmt **export → customer Blob → Event Grid → LumiTure Function → LumiTure Blob → BigQuery** (`load_table_from_dataframe`, **no GCS** for billing) |
+| IaC vehicle | Terraform (`../gcp/terraform/`) | **Bicep** (`bicep/`) |
 
 Because Azure Cloud Shell has no "open this git repo + tutorial" badge like Google's, the entry point is: open Azure Cloud Shell, then clone + start the tutorial.
 
