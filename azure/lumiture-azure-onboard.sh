@@ -301,10 +301,8 @@ create_export() {
     --schedule-status Active \
     -o none; then
     ok "Export '${name}' created (first Azure run lands in ~24h)"
-    warn "  NOTE: billing DATA does not reach LumiTure from this export alone. LumiTure"
-    warn "  ingests from its OWN blob via an event trigger — the export must be wired to"
-    warn "  AZURE_BILLING_EVENT_TRIGGER_URL (GET /platforms/azure/authorization/event-trigger-url/)."
-    warn "  That step is NOT automated here yet — see azure/README.md 'Known gap'."
+    log "  NOTE: the export alone doesn't deliver data — LumiTure ingests from its own blob"
+    log "  via the event trigger. Phase 2.7 wires that (needs --event-trigger-url or a JWT)."
   else
     warn "Export '${name}' create failed — see the az error above. (FOCUS export may need a newer az / portal step.)"
   fi
@@ -394,8 +392,11 @@ setup_event_subscription() {
     return 0
   fi
 
-  log "Phase 2.7 — Registering Microsoft.EventGrid provider…"
-  run az provider register --namespace Microsoft.EventGrid -o none
+  # Provider registration is async — MUST complete before event-subscription create,
+  # or the create fails with "Microsoft.EventGrid is not registered". --wait blocks
+  # until Registered (no-op/fast if already registered).
+  log "Phase 2.7 — Registering Microsoft.EventGrid provider (waiting for completion, can take ~1-2 min)…"
+  run az provider register --namespace Microsoft.EventGrid --wait -o none
 
   log "Phase 2.7 — Creating Event Grid subscription '${EVENT_SUB_NAME}' (BlobCreated → LumiTure webhook) on ${STORAGE_ACCOUNT}…"
   if run az eventgrid event-subscription create \
