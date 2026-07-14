@@ -41,7 +41,7 @@ If the wrong subscription is active, list them and pick one in Step 2.
 LumiTure reads your data through a **multi-tenant service principal** that must be consented into your Azure tenant once. This is a Microsoft browser flow — it can't be scripted.
 
 1. Open the LumiTure app → **Authorization → Connect Azure**, or go directly to
-   <https://app.lumiture.ai/authorization/billing-data-integration/azure>
+   <https://app.lumiture.ai/authorization/billing-integration/azure>
 2. Enter the subscription you want to onboard. You'll be redirected to Microsoft.
 3. Sign in as a **tenant admin** and click **Accept** on the consent prompt.
 
@@ -102,9 +102,11 @@ If you ran with your session token (launched from the wizard), the connection is
 
 Open the LumiTure Azure wizard:
 
-> <https://app.lumiture.ai/authorization/billing-data-integration/azure>
+> <https://app.lumiture.ai/authorization/billing-integration/azure>
 
 Enter the values and submit. The subscription status moves to `IN_PROGRESS`, then `CONNECTED` once LumiTure's subscription sync runs.
+
+> **Azure portal (zh-TW) field names** — to locate your IDs in the Traditional-Chinese Azure UI: `tenant_id` = **租用戶識別碼** (Tenant ID) · `subscription_id` = **訂用帳戶 ID** (Subscription ID).
 
 ## Step 4 — When does data appear?
 
