@@ -395,32 +395,88 @@ create_export() {
 # what matters is the action set below covering VM read + Monitor metrics read.
 # -----------------------------------------------------------------------------
 
+# Create one custom role definition. Echoes az's output so the caller can distinguish a
+# name collision from a real failure; returns az's exit code.
+_create_role_def() {
+  local name="$1" desc="$2" scope="$3" actions="$4"
+  local body
+  body=$(jq -cn --arg n "${name}" --arg d "${desc}" --arg s "${scope}" --argjson a "${actions}" \
+    '{Name: $n, IsCustom: true, Description: $d, Actions: $a, AssignableScopes: [$s]}') || return 1
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "DRY-RUN: az role definition create --role-definition ${body}"
+    return 0
+  fi
+  az role definition create --role-definition "${body}" -o none 2>&1
+}
+
 grant_usage_role() {
   local role_name="LumiTure FinOps Reader"
   local scope="/subscriptions/${SUBSCRIPTION_ID}"
-  local role_def
-  role_def=$(cat <<JSON
-{
-  "Name": "${role_name}",
-  "IsCustom": true,
-  "Description": "LumiTure FinOps usage-metrics reader (VM inventory + Azure Monitor metrics).",
-  "Actions": [
+  local description="LumiTure FinOps usage-metrics reader (VM inventory + Azure Monitor metrics)."
+  local actions='[
     "Microsoft.Compute/virtualMachines/read",
     "Microsoft.Compute/virtualMachines/instanceView/read",
     "Microsoft.Compute/skus/read",
     "Microsoft.Insights/Metrics/Read",
     "Microsoft.Resources/subscriptions/read",
     "Microsoft.Resources/subscriptions/resourceGroups/read"
-  ],
-  "AssignableScopes": ["${scope}"]
-}
-JSON
-)
+  ]'
+
   log "Phase 2.6 — Ensuring custom usage role '${role_name}' on subscription…"
-  if az role definition list --name "${role_name}" --scope "${scope}" --query "[0].roleName" -o tsv --only-show-errors 2>/dev/null | grep -q .; then
-    run az role definition update --role-definition "${role_def}" -o none || warn "Usage role update failed — see error above"
+
+  # Custom-role NAMES are unique per DIRECTORY (tenant), but a role is only VISIBLE at the
+  # scopes in its assignableScopes — and `az role definition list` implicitly scopes to the
+  # active subscription (which we just set to the target). So onboarding a second
+  # subscription in a tenant deadlocks: the lookup can't see the role (this subscription
+  # isn't in its scopes), create dies with RoleDefinitionWithSameNameExists, and assign
+  # dies with "Role ... doesn't exist". There is no directory-wide lookup to fix this with,
+  # so fall back to a per-subscription role name — no lookup needed, and it can't collide.
+  # `az role definition list --name` filters SERVER-side and silently fails to match names
+  # containing parentheses (our per-subscription name), so list the custom roles visible at
+  # this scope once and match client-side in jq.
+  local visible
+  visible=$(az role definition list --custom-role-only true -o json --only-show-errors 2>/dev/null) || visible='[]'
+  [[ -n "${visible}" ]] || visible='[]'
+
+  local existing_json="[]" found_name=""
+  local per_sub_name="${role_name} (${SUBSCRIPTION_ID:0:8})"
+  local candidate
+  for candidate in "${role_name}" "${per_sub_name}"; do
+    existing_json=$(printf '%s' "${visible}" | jq -c --arg n "${candidate}" '[.[] | select(.roleName == $n)]') || existing_json='[]'
+    if [[ "${existing_json}" != "[]" ]]; then found_name="${candidate}"; break; fi
+  done
+
+  if [[ -n "${found_name}" ]]; then
+    # Visible here → a prior run made it. Refresh Actions/Description, and keep every scope
+    # it already serves (merge, never replace) so no other subscription loses its grant.
+    role_name="${found_name}"
+    log "  '${role_name}' already covers this subscription — refreshing definition"
+    local merged
+    merged=$(printf '%s' "${existing_json}" | jq -c \
+      --arg s "${scope}" --arg d "${description}" --argjson a "${actions}" '
+        .[0]
+        | .assignableScopes = ((.assignableScopes + [$s]) | unique)
+        | .permissions[0].actions = $a
+        | .description = $d
+        | del(.createdOn, .updatedOn, .createdBy, .updatedBy, .type)
+      ') || { warn "Could not build role update payload"; return 0; }
+    run az role definition update --role-definition "${merged}" -o none \
+      || { warn "Usage role update failed — see error above"; return 0; }
   else
-    run az role definition create --role-definition "${role_def}" -o none || { warn "Usage role create failed — see error above"; return 0; }
+    local out rc=0
+    out=$(_create_role_def "${role_name}" "${description}" "${scope}" "${actions}") || rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+      if printf '%s' "${out}" | grep -q "RoleDefinitionWithSameNameExists"; then
+        # Taken by a subscription we cannot enumerate from here. Use a per-subscription name.
+        log "  '${role_name}' is taken elsewhere in this directory — creating '${per_sub_name}' for this subscription"
+        role_name="${per_sub_name}"
+        out=$(_create_role_def "${role_name}" "${description}" "${scope}" "${actions}") \
+          || { warn "Usage role create failed — ${out}"; return 0; }
+      else
+        warn "Usage role create failed — ${out}"
+        return 0
+      fi
+    fi
   fi
 
   log "Phase 2.6 — Assigning '${role_name}' to LumiTure SP (custom roles can take ~1m to propagate)…"
